@@ -10,6 +10,12 @@ Verifies that `--budget` limits are strictly enforced on all generation routes:
 
 from __future__ import annotations
 
+import asyncio
+import json
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
 import httpx
 import pytest
 
@@ -337,3 +343,272 @@ def test_dynamic_budget_exhaustion_blocks_all_providers() -> None:
 
     # Upstream should not have received any additional calls after budget exhaustion
     assert transport.call_count == 1
+
+
+class _FakeWebSocketDisconnect(Exception):
+    """Exception matching WebSocketDisconnect type-name check."""
+
+
+_FakeWebSocketDisconnect.__name__ = "WebSocketDisconnect_Fake"
+
+
+class _FakeUpstream:
+    """Fake upstream connection that records frames sent by Headroom."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = list(events)
+        self.sent: list[str] = []
+        self.closed = False
+        self.response = SimpleNamespace(headers=[])
+
+    async def __aenter__(self) -> _FakeUpstream:
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.closed = True
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def __aiter__(self):
+        return self._iter()
+
+    async def _iter(self):
+        for ev in self._events:
+            yield ev
+        await asyncio.Event().wait()
+
+
+class _ScriptedClientWS:
+    """Scripted client WebSocket delivering frames and tracking close state."""
+
+    def __init__(self, frames: list[str], *, on_frame2_callback=None) -> None:
+        self.headers = {"authorization": "Bearer test"}
+        self._frames = list(frames)
+        self.sent_text: list[str] = []
+        self.sent_bytes: list[bytes] = []
+        self.closed = False
+        self.close_code: int | None = None
+        self.close_reason: str | None = None
+        self.client = SimpleNamespace(host="127.0.0.1", port=12345)
+        self._on_frame2_callback = on_frame2_callback
+
+    async def accept(self, subprotocol=None, headers=None) -> None:
+        pass
+
+    async def receive_text(self) -> str:
+        if not self._frames:
+            raise _FakeWebSocketDisconnect("client closed")
+        frame = self._frames.pop(0)
+        if len(self._frames) == 0 and self._on_frame2_callback is not None:
+            self._on_frame2_callback()
+        return frame
+
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent_bytes.append(data)
+
+    async def close(self, code: int | None = None, reason: str | None = None) -> None:
+        self.closed = True
+        if code is not None or self.close_code is None:
+            self.close_code = code
+        if reason is not None or self.close_reason is None:
+            self.close_reason = reason
+
+
+def test_websocket_per_turn_budget_enforcement_blocks_late_response_create() -> None:
+    """A long-lived /v1/responses WebSocket opened under budget must reject subsequent
+
+    response.create frames once the budget is exhausted, and not forward them upstream.
+    """
+
+    async def _run() -> None:
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=True,
+            budget_limit_usd=0.05,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        app = create_app(config)
+        proxy = app.state.proxy
+        assert proxy.cost_tracker is not None
+
+        # Verify initial state opens under budget
+        allowed, _ = proxy.cost_tracker.check_budget()
+        assert allowed
+
+        first_frame = json.dumps(
+            {
+                "type": "response.create",
+                "response": {"model": "gpt-4o", "input": "first turn"},
+            }
+        )
+        second_frame = json.dumps(
+            {
+                "type": "response.create",
+                "response": {"model": "gpt-4o", "input": "second turn"},
+            }
+        )
+
+        upstream_events = [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "r_1",
+                        "model": "gpt-4o",
+                        "usage": {"input_tokens": 10, "output_tokens": 1},
+                    },
+                }
+            ),
+        ]
+        upstream = _FakeUpstream(upstream_events)
+
+        mod = MagicMock()
+
+        async def _fake_connect(*args, **kwargs):
+            return upstream
+
+        mod.connect = _fake_connect
+        mod.Subprotocol = str
+
+        def _exhaust_budget() -> None:
+            proxy.cost_tracker.record_tokens(
+                model="gpt-4o",
+                tokens_saved=0,
+                tokens_sent=100_000,
+                output_tokens=50_000,
+            )
+
+        client_ws = _ScriptedClientWS(
+            [first_frame, second_frame],
+            on_frame2_callback=_exhaust_budget,
+        )
+
+        with patch.dict(sys.modules, {"websockets": mod}):
+            await asyncio.wait_for(
+                proxy.handle_openai_responses_ws(client_ws),
+                timeout=3.0,
+            )
+
+        # Proves:
+        # 1. First frame was allowed and forwarded upstream
+        assert len(upstream.sent) == 1
+        assert json.loads(upstream.sent[0])["response"]["input"] == "first turn"
+
+        # 2. Budget is exhausted after turn 1 spend
+        allowed, _ = proxy.cost_tracker.check_budget()
+        assert not allowed
+
+        # 3. Subsequent response.create on same socket was rejected with 1008
+        assert client_ws.closed is True
+        assert client_ws.close_code == 1008
+        assert "Budget exceeded for daily period" in (client_ws.close_reason or "")
+
+        # 4. Subsequent response.create was NOT forwarded upstream
+        assert len(upstream.sent) == 1
+
+    asyncio.run(_run())
+
+
+def test_websocket_turn_completion_usage_exhausts_budget_and_blocks_next_turn() -> None:
+    """When turn 1 usage naturally exhausts the daily budget via the outcome funnel,
+
+    a subsequent response.create turn on the same socket is rejected and not forwarded.
+    """
+
+    async def _run() -> None:
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=True,
+            budget_limit_usd=0.05,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        app = create_app(config)
+        proxy = app.state.proxy
+        assert proxy.cost_tracker is not None
+
+        allowed, _ = proxy.cost_tracker.check_budget()
+        assert allowed
+
+        first_frame = json.dumps(
+            {
+                "type": "response.create",
+                "response": {"model": "gpt-4o", "input": "turn 1"},
+            }
+        )
+        second_frame = json.dumps(
+            {
+                "type": "response.create",
+                "response": {"model": "gpt-4o", "input": "turn 2"},
+            }
+        )
+
+        upstream_events = [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "r_1",
+                        "model": "gpt-4o",
+                        "usage": {"input_tokens": 100_000, "output_tokens": 50_000},
+                    },
+                }
+            ),
+        ]
+        upstream = _FakeUpstream(upstream_events)
+
+        mod = MagicMock()
+
+        async def _fake_connect(*args, **kwargs):
+            return upstream
+
+        mod.connect = _fake_connect
+        mod.Subprotocol = str
+
+        class _DelayedClientWS(_ScriptedClientWS):
+            async def receive_text(self) -> str:
+                if not self._frames:
+                    raise _FakeWebSocketDisconnect("client closed")
+                # Small yield on turn 2 to ensure turn 1 completion has recorded usage
+                if len(self._frames) == 1:
+                    await asyncio.sleep(0.05)
+                return self._frames.pop(0)
+
+        client_ws = _DelayedClientWS([first_frame, second_frame])
+
+        with patch.dict(sys.modules, {"websockets": mod}):
+            await asyncio.wait_for(
+                proxy.handle_openai_responses_ws(client_ws),
+                timeout=3.0,
+            )
+
+        assert client_ws.closed is True
+        assert client_ws.close_code == 1008
+        assert "Budget exceeded" in (client_ws.close_reason or "")
+        assert len(upstream.sent) == 1
+        assert json.loads(upstream.sent[0])["response"]["input"] == "turn 1"
+
+        allowed, _ = proxy.cost_tracker.check_budget()
+        assert not allowed
+
+    asyncio.run(_run())
