@@ -3530,6 +3530,15 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Budget check
+        if self.cost_tracker:
+            allowed, remaining = self.cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=self.cost_tracker.budget_denial_detail(),
+                )
+
         # Snapshot cache-key fields ONCE here (pre-upstream), reused verbatim
         # at the cache.set site below — re-reading body at set risks a mutated
         # body (e.g. tools reassigned) and a key mismatch (#327). OpenAI's
@@ -5635,6 +5644,15 @@ class OpenAIHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Budget check
+        if self.cost_tracker:
+            allowed, remaining = self.cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=self.cost_tracker.budget_denial_detail(),
+                )
+
         # Token counting on converted messages (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
         # Messages-only count, preserved for the output shaper's turn/size
@@ -6780,6 +6798,21 @@ class OpenAIHandlerMixin:
             )
             await websocket.close(code=1008, reason="origin not allowed")
             return
+
+        # Budget check
+        if self.cost_tracker:
+            allowed, _ = self.cost_tracker.check_budget()
+            if not allowed:
+                logger.warning(
+                    "event=websocket_budget_exceeded request_id=%s session_id=%s",
+                    request_id,
+                    session_id,
+                )
+                await websocket.close(
+                    code=1008,
+                    reason=self.cost_tracker.budget_denial_detail()[:120],
+                )
+                return
         # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
         # the Responses endpoint, so apply the same path-based stamp here before
         # classify_client runs (parallels server.py / should_stamp_codex_client).

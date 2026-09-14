@@ -404,6 +404,15 @@ class GeminiHandlerMixin:
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
                 )
 
+        # Budget check
+        if self.cost_tracker:
+            allowed, remaining = self.cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=self.cost_tracker.budget_denial_detail(),
+                )
+
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")
         messages, preserved_indices = self._gemini_contents_to_messages(
@@ -1004,6 +1013,7 @@ class GeminiHandlerMixin:
         request: Request,
     ) -> StreamingResponse | JSONResponse:
         """Handle Pi/OpenClaw Google Cloud Code Assist and Antigravity streaming requests."""
+        from fastapi import HTTPException
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
@@ -1061,6 +1071,15 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_cca,
             request_id=request_id,
         )
+
+        # Budget check
+        if self.cost_tracker:
+            allowed, remaining = self.cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=self.cost_tracker.budget_denial_detail(),
+                )
 
         system_instruction = request_payload.get("systemInstruction")
         optimization_system_instruction = None if is_antigravity else system_instruction
@@ -1173,6 +1192,7 @@ class GeminiHandlerMixin:
         model: str,
     ) -> StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
+        from fastapi import HTTPException
         from fastapi.responses import JSONResponse
 
         from headroom.proxy.helpers import _read_request_json
@@ -1215,6 +1235,15 @@ class GeminiHandlerMixin:
             stripped_count=_pre_strip_count_gem_stream,
             request_id=request_id,
         )
+
+        # Budget check
+        if self.cost_tracker:
+            allowed, remaining = self.cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=self.cost_tracker.budget_denial_detail(),
+                )
 
         # Token counting (offloaded off the event loop — GH #1701). Reuse the
         # shared _dict_parts coercion and keep only str text values: count_text
