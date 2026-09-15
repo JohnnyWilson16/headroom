@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+    from headroom.proxy.cost import CostTracker
+
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.copilot_auth import build_copilot_upstream_url
 from headroom.proxy.auth_mode import classify_client
@@ -47,7 +49,7 @@ class _GeminiContinuationError(Exception):
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
 
-    cost_tracker: Any = None
+    cost_tracker: CostTracker | None = None
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
@@ -407,7 +409,7 @@ class GeminiHandlerMixin:
                 )
 
         # Budget check
-        cost_tracker = getattr(self, "cost_tracker", None)
+        cost_tracker = self.cost_tracker
         if cost_tracker:
             allowed, remaining = cost_tracker.check_budget()
             if not allowed:
@@ -1076,7 +1078,7 @@ class GeminiHandlerMixin:
         )
 
         # Budget check
-        cost_tracker = getattr(self, "cost_tracker", None)
+        cost_tracker = self.cost_tracker
         if cost_tracker:
             allowed, remaining = cost_tracker.check_budget()
             if not allowed:
@@ -1241,7 +1243,7 @@ class GeminiHandlerMixin:
         )
 
         # Budget check
-        cost_tracker = getattr(self, "cost_tracker", None)
+        cost_tracker = self.cost_tracker
         if cost_tracker:
             allowed, remaining = cost_tracker.check_budget()
             if not allowed:
