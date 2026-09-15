@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     from fastapi import Request, WebSocket
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+    from headroom.proxy.cost import CostTracker
+
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
@@ -1724,7 +1726,7 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
-    cost_tracker: Any = None
+    cost_tracker: CostTracker | None = None
 
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
@@ -3533,7 +3535,7 @@ class OpenAIHandlerMixin:
                 )
 
         # Budget check
-        cost_tracker = getattr(self, "cost_tracker", None)
+        cost_tracker = self.cost_tracker
         if cost_tracker:
             allowed, remaining = cost_tracker.check_budget()
             if not allowed:
@@ -5648,7 +5650,7 @@ class OpenAIHandlerMixin:
                 )
 
         # Budget check
-        cost_tracker = getattr(self, "cost_tracker", None)
+        cost_tracker = self.cost_tracker
         if cost_tracker:
             allowed, remaining = cost_tracker.check_budget()
             if not allowed:
@@ -6804,7 +6806,7 @@ class OpenAIHandlerMixin:
             return
 
         # Budget check
-        cost_tracker = getattr(self, "cost_tracker", None)
+        cost_tracker = self.cost_tracker
         if cost_tracker:
             allowed, _ = cost_tracker.check_budget()
             if not allowed:
@@ -7992,7 +7994,7 @@ class OpenAIHandlerMixin:
             )
 
             if ws_connected:
-                cost_tracker = getattr(self, "cost_tracker", None)
+                cost_tracker = self.cost_tracker
                 if cost_tracker:
                     allowed, _ = cost_tracker.check_budget()
                     if not allowed:
@@ -8385,7 +8387,7 @@ class OpenAIHandlerMixin:
                                     isinstance(_inbound_frame_body, dict)
                                     and _inbound_frame_body.get("type") == "response.create"
                                 ):
-                                    cost_tracker = getattr(self, "cost_tracker", None)
+                                    cost_tracker = self.cost_tracker
                                     if cost_tracker:
                                         allowed, _ = cost_tracker.check_budget()
                                         if not allowed:
@@ -9137,7 +9139,7 @@ class OpenAIHandlerMixin:
                         ws_last_upstream_frame_type,
                     )
             else:
-                cost_tracker = getattr(self, "cost_tracker", None)
+                cost_tracker = self.cost_tracker
                 if cost_tracker:
                     allowed, _ = cost_tracker.check_budget()
                     if not allowed:

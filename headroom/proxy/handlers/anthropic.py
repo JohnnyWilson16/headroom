@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import Response, StreamingResponse
 
+    from headroom.proxy.cost import CostTracker
+
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
@@ -278,7 +280,7 @@ def _looks_like_sse_response(response: httpx.Response) -> bool:
 class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
-    cost_tracker: Any = None
+    cost_tracker: CostTracker | None = None
 
     def _adapt_event_stream_to_json(
         self,
@@ -1262,7 +1264,7 @@ class AnthropicHandlerMixin:
                     )
 
             # Budget check
-            cost_tracker = getattr(self, "cost_tracker", None)
+            cost_tracker = self.cost_tracker
             if cost_tracker:
                 allowed, remaining = cost_tracker.check_budget()
                 if not allowed:

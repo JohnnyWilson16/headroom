@@ -1,10 +1,12 @@
 """Integration tests for proxy budget enforcement (Issue #3374).
 
-Verifies that `--budget` limits are strictly enforced on all generation routes:
+Verifies that `--budget` limits are enforced on these generation routes:
 - OpenAI chat completions (`/v1/chat/completions`)
-- OpenAI responses (`/v1/responses` HTTP and WebSocket)
+- OpenAI responses (`/v1/responses` HTTP and WebSocket: handshake, first frame,
+  later `response.create` frames, and the HTTP fallback)
 - Gemini generate content (`/v1beta/models/{model}:generateContent`)
 - Gemini stream generate content (`/v1beta/models/{model}:streamGenerateContent`)
+- Google Cloud Code Assist stream (`/v1internal:streamGenerateContent`)
 - Anthropic messages (`/v1/messages`) for parity
 """
 
@@ -14,7 +16,7 @@ import asyncio
 import json
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -214,6 +216,22 @@ def test_zero_budget_blocks_gemini_stream_generate_content() -> None:
         headers={"x-goog-api-key": "test-gemini-key"},
         json={
             "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+        },
+    )
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Budget exceeded for daily period"
+    assert transport.call_count == 0
+
+
+def test_zero_budget_blocks_google_cloudcode_stream() -> None:
+    client, transport = _build_proxy_client(budget_limit_usd=0.0)
+
+    response = client.post(
+        "/v1internal:streamGenerateContent",
+        json={
+            "model": "gemini-2.5-pro",
+            "request": {"contents": [{"role": "user", "parts": [{"text": "Hello"}]}]},
         },
     )
 
@@ -496,6 +514,8 @@ def test_websocket_per_turn_budget_enforcement_blocks_late_response_create() -> 
             [first_frame, second_frame],
             on_frame2_callback=_exhaust_budget,
         )
+        deregister_spy = MagicMock(side_effect=proxy.ws_sessions.deregister_and_count)
+        proxy.ws_sessions.deregister_and_count = deregister_spy
 
         with patch.dict(sys.modules, {"websockets": mod}):
             await asyncio.wait_for(
@@ -519,6 +539,10 @@ def test_websocket_per_turn_budget_enforcement_blocks_late_response_create() -> 
 
         # 4. Subsequent response.create was NOT forwarded upstream
         assert len(upstream.sent) == 1
+
+        # 5. Session teardown records the budget rejection as the termination cause
+        deregister_spy.assert_called_once()
+        assert deregister_spy.call_args.kwargs["cause"] == "budget_exceeded"
 
     asyncio.run(_run())
 
@@ -589,9 +613,13 @@ def test_websocket_turn_completion_usage_exhausts_budget_and_blocks_next_turn() 
             async def receive_text(self) -> str:
                 if not self._frames:
                     raise _FakeWebSocketDisconnect("client closed")
-                # Small yield on turn 2 to ensure turn 1 completion has recorded usage
+                # Hold turn 2 until turn 1's response.completed usage is booked,
+                # rather than sleeping for a fixed wall-clock interval.
                 if len(self._frames) == 1:
-                    await asyncio.sleep(0.05)
+                    for _ in range(400):
+                        if not proxy.cost_tracker.check_budget()[0]:
+                            break
+                        await asyncio.sleep(0.005)
                 return self._frames.pop(0)
 
         client_ws = _DelayedClientWS([first_frame, second_frame])
@@ -610,5 +638,102 @@ def test_websocket_turn_completion_usage_exhausts_budget_and_blocks_next_turn() 
 
         allowed, _ = proxy.cost_tracker.check_budget()
         assert not allowed
+
+    asyncio.run(_run())
+
+
+def _ws_budget_proxy(**overrides):
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=True,
+        budget_limit_usd=0.05,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+        **overrides,
+    )
+    proxy = create_app(config).state.proxy
+    assert proxy.cost_tracker is not None
+    assert proxy.cost_tracker.check_budget()[0]
+    return proxy
+
+
+def _spend_past_budget(proxy) -> None:
+    proxy.cost_tracker.record_tokens(
+        model="gpt-4o",
+        tokens_saved=0,
+        tokens_sent=100_000,
+        output_tokens=50_000,
+    )
+
+
+def _fake_websockets_module(connect):
+    mod = MagicMock()
+    mod.connect = connect
+    mod.Subprotocol = str
+    return mod
+
+
+def _response_create_frame(text: str) -> str:
+    return json.dumps({"type": "response.create", "response": {"model": "gpt-4o", "input": text}})
+
+
+def test_websocket_first_frame_blocked_when_budget_exhausted_after_handshake() -> None:
+    """Budget spent between the handshake preflight and the first frame must stop
+    that frame before it reaches the already-connected upstream socket.
+    """
+
+    async def _run() -> None:
+        proxy = _ws_budget_proxy()
+        upstream = _FakeUpstream([])
+
+        async def _fake_connect(*args, **kwargs):
+            _spend_past_budget(proxy)
+            return upstream
+
+        client_ws = _ScriptedClientWS([_response_create_frame("hi")])
+
+        with patch.dict(sys.modules, {"websockets": _fake_websockets_module(_fake_connect)}):
+            await asyncio.wait_for(
+                proxy.handle_openai_responses_ws(client_ws),
+                timeout=3.0,
+            )
+
+        assert upstream.sent == []
+        assert upstream.closed is True
+        assert client_ws.close_code == 1008
+        assert "Budget exceeded for daily period" in (client_ws.close_reason or "")
+
+    asyncio.run(_run())
+
+
+def test_websocket_http_fallback_blocked_when_budget_exhausted() -> None:
+    """When the upstream WebSocket upgrade fails, the HTTP fallback must not
+    dispatch a paid request once the budget is exhausted.
+    """
+
+    async def _run() -> None:
+        proxy = _ws_budget_proxy(retry_max_attempts=1)
+        proxy._ws_http_fallback = AsyncMock(return_value=(0, 0, 0, 0, 0))
+
+        async def _fake_connect(*args, **kwargs):
+            _spend_past_budget(proxy)
+            raise OSError("upstream websocket unavailable")
+
+        client_ws = _ScriptedClientWS([_response_create_frame("hi")])
+
+        with patch.dict(sys.modules, {"websockets": _fake_websockets_module(_fake_connect)}):
+            await asyncio.wait_for(
+                proxy.handle_openai_responses_ws(client_ws),
+                timeout=3.0,
+            )
+
+        proxy._ws_http_fallback.assert_not_awaited()
+        assert client_ws.close_code == 1008
+        assert "Budget exceeded for daily period" in (client_ws.close_reason or "")
 
     asyncio.run(_run())
