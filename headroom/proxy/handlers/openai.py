@@ -1724,6 +1724,8 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
+    cost_tracker: Any = None
+
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
 
@@ -3531,12 +3533,13 @@ class OpenAIHandlerMixin:
                 )
 
         # Budget check
-        if self.cost_tracker:
-            allowed, remaining = self.cost_tracker.check_budget()
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
             if not allowed:
                 raise HTTPException(
                     status_code=429,
-                    detail=self.cost_tracker.budget_denial_detail(),
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Snapshot cache-key fields ONCE here (pre-upstream), reused verbatim
@@ -5645,12 +5648,13 @@ class OpenAIHandlerMixin:
                 )
 
         # Budget check
-        if self.cost_tracker:
-            allowed, remaining = self.cost_tracker.check_budget()
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
             if not allowed:
                 raise HTTPException(
                     status_code=429,
-                    detail=self.cost_tracker.budget_denial_detail(),
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Token counting on converted messages (offloaded off the event loop — GH #1701)
@@ -6800,8 +6804,9 @@ class OpenAIHandlerMixin:
             return
 
         # Budget check
-        if self.cost_tracker:
-            allowed, _ = self.cost_tracker.check_budget()
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, _ = cost_tracker.check_budget()
             if not allowed:
                 logger.warning(
                     "event=websocket_budget_exceeded request_id=%s session_id=%s",
@@ -6810,7 +6815,7 @@ class OpenAIHandlerMixin:
                 )
                 await websocket.close(
                     code=1008,
-                    reason=self.cost_tracker.budget_denial_detail()[:120],
+                    reason=cost_tracker.budget_denial_detail()[:120],
                 )
                 return
         # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
@@ -7987,8 +7992,9 @@ class OpenAIHandlerMixin:
             )
 
             if ws_connected:
-                if self.cost_tracker:
-                    allowed, _ = self.cost_tracker.check_budget()
+                cost_tracker = getattr(self, "cost_tracker", None)
+                if cost_tracker:
+                    allowed, _ = cost_tracker.check_budget()
                     if not allowed:
                         logger.warning(
                             "event=websocket_budget_exceeded request_id=%s session_id=%s frame=1",
@@ -7999,7 +8005,7 @@ class OpenAIHandlerMixin:
                         with contextlib.suppress(Exception):
                             await websocket.close(
                                 code=1008,
-                                reason=self.cost_tracker.budget_denial_detail()[:120],
+                                reason=cost_tracker.budget_denial_detail()[:120],
                             )
                         with contextlib.suppress(Exception):
                             await upstream.close()
@@ -8379,8 +8385,9 @@ class OpenAIHandlerMixin:
                                     isinstance(_inbound_frame_body, dict)
                                     and _inbound_frame_body.get("type") == "response.create"
                                 ):
-                                    if self.cost_tracker:
-                                        allowed, _ = self.cost_tracker.check_budget()
+                                    cost_tracker = getattr(self, "cost_tracker", None)
+                                    if cost_tracker:
+                                        allowed, _ = cost_tracker.check_budget()
                                         if not allowed:
                                             logger.warning(
                                                 "event=websocket_budget_exceeded request_id=%s session_id=%s frame=%d",
@@ -8392,7 +8399,7 @@ class OpenAIHandlerMixin:
                                             with contextlib.suppress(Exception):
                                                 await websocket.close(
                                                     code=1008,
-                                                    reason=self.cost_tracker.budget_denial_detail()[
+                                                    reason=cost_tracker.budget_denial_detail()[
                                                         :120
                                                     ],
                                                 )
@@ -9130,8 +9137,9 @@ class OpenAIHandlerMixin:
                         ws_last_upstream_frame_type,
                     )
             else:
-                if self.cost_tracker:
-                    allowed, _ = self.cost_tracker.check_budget()
+                cost_tracker = getattr(self, "cost_tracker", None)
+                if cost_tracker:
+                    allowed, _ = cost_tracker.check_budget()
                     if not allowed:
                         logger.warning(
                             "event=websocket_budget_exceeded request_id=%s session_id=%s fallback=1",
@@ -9142,7 +9150,7 @@ class OpenAIHandlerMixin:
                         with contextlib.suppress(Exception):
                             await websocket.close(
                                 code=1008,
-                                reason=self.cost_tracker.budget_denial_detail()[:120],
+                                reason=cost_tracker.budget_denial_detail()[:120],
                             )
                         return
                 # WS upgrade failed (HTTP 500 from OpenAI is common).

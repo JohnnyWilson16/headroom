@@ -47,6 +47,8 @@ class _GeminiContinuationError(Exception):
 class GeminiHandlerMixin:
     """Mixin providing Gemini API handler methods for HeadroomProxy."""
 
+    cost_tracker: Any = None
+
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
 
@@ -405,12 +407,13 @@ class GeminiHandlerMixin:
                 )
 
         # Budget check
-        if self.cost_tracker:
-            allowed, remaining = self.cost_tracker.check_budget()
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
             if not allowed:
                 raise HTTPException(
                     status_code=429,
-                    detail=self.cost_tracker.budget_denial_detail(),
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Convert Gemini format to messages for optimization
@@ -1073,12 +1076,13 @@ class GeminiHandlerMixin:
         )
 
         # Budget check
-        if self.cost_tracker:
-            allowed, remaining = self.cost_tracker.check_budget()
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
             if not allowed:
                 raise HTTPException(
                     status_code=429,
-                    detail=self.cost_tracker.budget_denial_detail(),
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         system_instruction = request_payload.get("systemInstruction")
@@ -1237,12 +1241,13 @@ class GeminiHandlerMixin:
         )
 
         # Budget check
-        if self.cost_tracker:
-            allowed, remaining = self.cost_tracker.check_budget()
+        cost_tracker = getattr(self, "cost_tracker", None)
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
             if not allowed:
                 raise HTTPException(
                     status_code=429,
-                    detail=self.cost_tracker.budget_denial_detail(),
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Token counting (offloaded off the event loop — GH #1701). Reuse the
